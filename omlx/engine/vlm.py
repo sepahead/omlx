@@ -3990,6 +3990,17 @@ class VLMBatchedEngine(BaseEngine):
             logger.debug("Failed to count VLM image tokens", exc_info=True)
             return None
 
+    def _has_image_token(self, input_ids: Any, image_token: str) -> bool:
+        tokenizer = getattr(self._processor, "tokenizer", None)
+        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+        token_id = convert(image_token) if callable(convert) else None
+        if not isinstance(token_id, int) or token_id == getattr(
+            tokenizer, "unk_token_id", None
+        ):
+            return False
+        ids = input_ids if isinstance(input_ids, mx.array) else mx.array(input_ids)
+        return bool(mx.any(ids == token_id).item())
+
     def _cached_video_features(
         self, video_identity: str, input_ids: Any, extra_model_inputs: dict
     ) -> mx.array | None:
@@ -4303,12 +4314,16 @@ class VLMBatchedEngine(BaseEngine):
             # A text-only chat template renders images as prose, and the
             # processor then fails with a misleading image-count error.
             # Gemma 3 expands boi_token into image tokens in its processor.
+            # LocateAnything's processor expands its own placeholder, so only
+            # the processed ids show that the image tokens are missing.
             image_token = getattr(
                 self._processor,
                 "boi_token" if model_type == "gemma3" else "image_token",
                 None,
             )
+            processed_image_token = getattr(self._processor, "image_token", None)
             texts = [item for item in prompts if isinstance(item, str)]
+            text_only_error = None
             if (
                 num_images
                 and isinstance(image_token, str)
@@ -4316,7 +4331,7 @@ class VLMBatchedEngine(BaseEngine):
                 and texts
                 and not any(image_token in text for text in texts)
             ):
-                raise InvalidRequestError(
+                text_only_error = InvalidRequestError(
                     "The chat template did not emit image tokens for the "
                     "attached images. This checkpoint likely ships a text-only "
                     "chat template; use the vision template from the upstream "
@@ -4328,13 +4343,24 @@ class VLMBatchedEngine(BaseEngine):
             if model_type == "unlimited-ocr" and isinstance(prompt, str):
                 prompts = prompt
             # Tokenize text and preprocess images and audio
-            inputs = prepare_inputs(
-                self._processor,
-                images=images if images else None,
-                audio=audio if audio else None,
-                videos=videos if videos else None,
-                prompts=prompts,
-            )
+            try:
+                inputs = prepare_inputs(
+                    self._processor,
+                    images=images if images else None,
+                    audio=audio if audio else None,
+                    videos=videos if videos else None,
+                    prompts=prompts,
+                )
+            except ValueError as exc:
+                if text_only_error is not None:
+                    raise text_only_error from exc
+                raise
+            if text_only_error is not None and not (
+                isinstance(processed_image_token, str)
+                and processed_image_token
+                and self._has_image_token(inputs["input_ids"], processed_image_token)
+            ):
+                raise text_only_error
 
         input_ids = inputs["input_ids"]
         pixel_values = inputs.get("pixel_values")
