@@ -1711,10 +1711,41 @@ class TestPrepareVisionInputs:
 
         with pytest.raises(InvalidRequestError, match="text-only chat template"):
             engine._prepare_vision_inputs(messages, images)
-        mock_prepare.assert_not_called()
 
+        # The processor's own image-count error is replaced too.
+        mock_prepare.side_effect = ValueError("More images than image tokens")
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+
+        mock_prepare.side_effect = None
         engine._processor.apply_chat_template.return_value = "<|image_pad|>Describe"
         engine._prepare_vision_inputs(messages, images)
+        assert mock_prepare.call_count == 3
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_processor_expanded_image_placeholder_passes(
+        self, mock_vlm_act, mock_prepare
+    ):
+        """LocateAnything's template emits <image-N>; the processor expands it."""
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision(model_type="locateanything")
+        engine._processor.image_token = "<IMG_CONTEXT>"
+        engine._processor.apply_chat_template.return_value = "<image-1>Describe"
+        engine._processor.tokenizer = MagicMock(unk_token_id=None)
+        engine._processor.tokenizer.convert_tokens_to_ids.return_value = 151665
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 151665, 151665, 2]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        engine._prepare_vision_inputs(messages, images)
+
         mock_prepare.assert_called_once()
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
